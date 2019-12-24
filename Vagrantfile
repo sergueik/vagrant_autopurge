@@ -1,0 +1,304 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Tested with Vagrant 2.0.2 https://releases.hashicorp.com/vagrant/2.0.2/
+require 'fileutils'
+require 'find'
+require 'pathname'
+
+box_name          = ENV.fetch('BOX_NAME', 'trusty64')
+# for downloading boxes set to true export BOX_DOWNLOAD=true;vagrant up
+box_download      = ENV.fetch('BOX_DOWNLOAD', false)
+box_download      = (box_download =~ (/^(true|t|yes|y|1)$/i))
+# e.g. for Windows test, export BOX_NAME='windows7' for ubuntu test, export BOX_NAME='trusty64'
+@debug        = ENV.fetch('DEBUG', 'false') # legacy default, left intact for the reference
+# e.g. export BOX_BASEDIR='/media/sergueik/Windows8_OS/Users/Serguei'
+# NOTE: with a filesystem freespace-constrained environment also need
+# symlink the '~/VirtualBox VMs' and '~/.vagrant.d/boxes/#{box_name}' to
+# point to matching directories under ${BOX_BASEDIR}
+box_basedir   = ENV.fetch('BOX_BASEDIR', nil)
+box_bootstrap = ENV.fetch('BOX_BOOTSTRAP', false)
+box_chefdk    = ENV.fetch('BOX_CHEFDK', false)
+@debug        = (@debug =~ (/^(true|t|yes|y|1)$/i))
+
+def file_dir_or_symlink_exists?(filepath)
+  status = false
+  o = Pathname.new(filepath)
+  if o.exist?
+    if o.file?
+      if @debug
+        $stderr.puts (filepath + ' is a file')
+      end
+      status = true
+    end
+    if o.directory?
+      if @debug
+        $stderr.puts (filepath + ' is a directory')
+      end
+      status = true
+    end
+    if o.symlink?
+      if @debug
+        $stderr.puts (filepath + ' is a symlink')
+      end
+      status = true
+    end
+  end
+  status
+end
+if box_basedir.nil?
+  basedir = ENV.fetch('USERPROFILE', '')
+  basedir = ENV.fetch('HOME', '') if basedir == ''
+  basedir = basedir.gsub('\\', '/')
+else
+  basedir = box_basedir
+  home = ENV.fetch('HOME')
+  unless file_dir_or_symlink_exists? "#{home}/VirtualBox VMs"
+    if @debug
+      $stderr.puts 'Creating symlink ' + "#{box_basedir}/VirtualBox VMs" + ' to ' + "#{home}/VirtualBox VMs"
+    end
+    File.symlink "#{box_basedir}/VirtualBox VMs", "#{home}/VirtualBox VMs"
+  end
+  if ! box_name.nil?
+    vagrant_box_dir = ".vagrant.d/boxes/#{box_name}"
+    unless file_dir_or_symlink_exists? "#{home}/#{vagrant_box_dir}"
+      if @debug
+        $stderr.puts 'Creating symlink ' +"#{home}/#{vagrant_box_dir}" + ' to ' + "#{box_basedir}/#{vagrant_box_dir}"
+      end
+        File.symlink "#{box_basedir}/vagrant.d/boxes/#{box_name}", "#{home}/vagrant.d/boxes/#{box_name}"
+    end
+  end
+end
+if @debug
+  puts "box_name=#{box_name}"
+  puts "box_gui=#{box_gui}"
+  puts "box_cpus=#{box_cpus}"
+  puts "box_memory=#{box_memory}"
+end
+
+VAGRANTFILE_API_VERSION = '2'
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+
+  # Localy cached images
+  case box_name
+
+    when /trusty32/
+      config_vm_box     = 'ubuntu'
+      box_filepath      = "#{basedir}/Downloads/trusty-server-cloudimg-i386-vagrant-disk1.box"
+      config_vm_box_url = "file://#{box_filepath}"
+      box_base_url      = 'https://cloud-images.ubuntu.com/vagrant/trusty/current'
+      box_download_url  = "#{box_base_url}/trusty-server-cloudimg-i386-vagrant-disk1.box"
+      if box_download
+        $stderr.puts "Downloading #{box_download_url} to #{box_filepath}"
+        %x|curl -k -L #{box_download_url} -o #{box_filepath}|
+      end
+    when /trusty64/
+      config_vm_box     = 'ubuntu'
+      config_vm_default = 'linux'
+      box_filepath      = "#{basedir}/Downloads/trusty-server-cloudimg-amd64-vagrant-disk1.box"
+      config_vm_box_url = "file://#{box_filepath}"
+      box_base_url      = 'https://cloud-images.ubuntu.com/vagrant/trusty/current'
+      box_download_url  = "#{box_base_url}/trusty-server-cloudimg-amd64-vagrant-disk1.box"
+      if box_download
+        $stderr.puts "Downloading #{box_download_url} to #{box_filepath}"
+        %x|curl -k -L #{box_download_url} -o #{box_filepath}|
+      end
+  else
+    # cached boxes from https://developer.microsoft.com/en-us/microsoft-edge/tools/vms/
+    # see also https://app.vagrantup.com/designerror/boxes/windows-7
+    config_vm_default = 'windows'
+    config_vm_box_bootstrap = box_bootstrap
+    config_vm_box     = 'windows7'
+    config_vm_box_url = "file://#{basedir}/Downloads/vagrant-win7-ie11.box"
+  end
+
+  config.vm.define config_vm_default do |config|
+    config.vm.box = config_vm_box
+    config.vm.box_url  = config_vm_box_url
+    puts "Configuring '#{config.vm.box}'"
+    # Configure guest-specific port forwarding
+    if config.vm.box !~ /windows/
+      config.vm.network 'forwarded_port', guest: 5901, host: 5901, id: 'vnc', auto_correct: true
+      config.vm.host_name = 'linux.example.com'
+      config.vm.hostname = 'linux.example.com'
+    else
+      # clear HTTP_PROXY to prevent
+      # WinRM::WinRMHTTPTransportError: Bad HTTP response returned from server (503)
+      # also often seen between windows hosts and windows guests, not solved
+      # User: vagrant
+      # Endpoint: http://127.0.0.1:5985/wsman
+      # Message: WinRM::WinRMAuthorizationError
+      # https://github.com/chef/knife-windows/issues/143
+      ENV.delete('HTTP_PROXY')
+      # NOTE: WPA dialog blocks chef solo and makes Vagrant fail on modern.ie box
+      config.vm.communicator      = 'winrm'
+      config.winrm.username       = 'vagrant'
+      config.winrm.password       = 'vagrant'
+      config.vm.guest             = :windows
+      config.windows.halt_timeout = 120
+      # Port forward WinRM and RDP
+      # https://www.vagrantup.com/docs/boxes/base.html
+      # https://codeblog.dotsandbrackets.com/vagrant-windows/
+      # does not seem to work from Windows host - pending validation from linux host
+      config.vm.network :forwarded_port, guest: 3389, host: 3389, id: 'rdp', auto_correct: true
+      config.vm.network :forwarded_port, guest: 5985, host: 5985, id: 'winrm', auto_correct:true
+      config.vm.network :forwarded_port, guest: 5986, host: 5986, auto_correct:true
+      config.vm.network :forwarded_port, guest: 389, host: 1389
+      config.vm.host_name         = 'windows7'
+      config.vm.boot_timeout      = 120
+      # Ensure that all networks are set to 'private'
+      config.windows.set_work_network = true
+      # on Windows, use default data_bags share
+    end
+    # Configure common synced folder
+    config.vm.synced_folder './' , '/vagrant'
+    # Configure common port forwarding
+    config.vm.network 'forwarded_port', guest: 4444, host: 4444, id: 'selenium', auto_correct:true
+    config.vm.network 'forwarded_port', guest: 3000, host: 3000, id: 'reactor', auto_correct:true
+    config.vm.provider 'virtualbox' do |vb|
+      vb.gui = box_gui
+      vb.customize ['modifyvm', :id, '--cpus', box_cpus ]
+      vb.customize ['modifyvm', :id, '--memory', box_memory ]
+      vb.customize ['modifyvm', :id, '--clipboard', 'bidirectional']
+      vb.customize ['modifyvm', :id, '--accelerate3d', 'off']
+      vb.customize ['modifyvm', :id, '--audio', 'none']
+      vb.customize ['modifyvm', :id, '--usb', 'off']
+    end
+# TODO: detect and abort run if there are vi files
+# FATAL: Chef::Exceptions::AttributeNotFound: could not find filename for attribute .default.rb.swp in cookbook example
+
+    # Provision software
+    puts "Provision software for '#{config.vm.box}'"
+    case config_vm_box
+      when /ubuntu|debian/
+        config.vm.provision 'shell', inline: <<-EOF
+# create the maven repo mockup
+REPOSITORY='/home/vagrant/.m2/repository'
+mkdir -p $REPOSITORY
+# populate the maven repo mockup with real file to exercise the load
+# the workspace directory has a small repository to seed the VM
+sudo cp -R /vagrant/repository/ $REPOSITORY
+chown -R vagrant:vagrant $REPOSITORY
+du -s $REPOSITORY
+
+  # install java directly
+  # NOTE: trusty repos do not have java 1.8
+  apt-get -qqy update
+  apt-get install -qqy openjdk-7-jdk
+  update-alternatives --set java /usr/lib/jvm/java-7-openjdk-amd64/jre/bin/java
+  # NOTE: starting from 2.54 Jenkins requires java 1.8
+  # TODO: enforce legacy Jenkins in recipe
+  add-apt-repository -y ppa:openjdk-r/ppa
+  apt-get -qqy update
+  apt-get install -qqy openjdk-8-jdk
+  update-alternatives --set java /usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java
+EOF
+        # Use Chef provisioner with Ubuntu
+        # https://www.vagrantup.com/docs/provisioning/chef_solo.html
+        config.vm.provision :chef_solo do |chef|
+          chef.version = '14.10.9'
+          # chef.data_bags_path = 'data_bags'
+          # will require downloading locally -
+          # all stock cookbooks need to be kept in.gitignore
+          chef.add_recipe 'example'
+          chef.log_level = 'info'
+	  # TODO: fix error with compiling windows cookbooks which become a dependency of the multi-platform recipe now:
+	  # FATAL: ArgumentError: unknown keyword: on_platforms
+        end
+      else # windows
+        # TODO: find and abort provision run if there are temp vi files in cookbooks
+        # FATAL: Chef::Exceptions::AttributeNotFound: could not find filename for attribute .default.rb.swp in cookbook example
+        found_tempfiles = false
+        tempfiles = []
+        Find.find('cookbooks') do |path|
+          if FileTest.file?(path)
+            if File.basename(path)[0] =~ /^\..*sw.$/
+              found_tempfiles = true
+        tempfiles += File.basename(path)[0]
+              break
+            else
+              next
+            end
+          end
+        end 
+        if found_tempfiles
+          $stderr.puts ( 'Found tempfiles: ' + tempfiles.join(','))
+        end
+        if config_vm_box_bootstrap
+          config.vm.provision :shell, inline: <<-EOF
+            set-executionpolicy Unrestricted
+            # TODO: Windows PowerShell updated your execution policy  successfully, but the setting is overridden by a policy defined at a more  specific scope.
+            # Due to the override, your shell will retain its current effective execution policy of Bypass. Type "Get-ExecutionPolicy -List" to view
+            # NOTE: when uncommended, leads to an error
+            # Bad HTTP response returned from server. Body(if present): (500). (WinRM::WinRMHTTPTransportError)
+            # run 'bootstrap_legacy.cmd' instead.
+            # enable-psremoting -force
+          EOF
+          if File.exist?('install_net4.ps1')
+            $stderr.puts '(Re)install .Net 4'
+            config.vm.provision :shell, :path => 'install_net4.ps1'
+          end
+          if box_chefdk
+            if File.exist?('install_chocolatey.ps1')
+              $stderr.puts 'Install chocolatey'
+              config.vm.provision :shell, :path => 'install_chocolatey.ps1'
+            end
+            if File.exist?('install_chef.ps1')
+              $stderr.puts  'install puppet and chef using chocolatey'
+              config.vm.provision :shell, :path => 'install_chef.ps1', :args => ['-package_name', 'chefdk', '-package_version', '3.5.13']
+              # NOTE: Exit code was '1603'. Exit code indicates the following: Generic MSI Error. This is a local environment error, not an issue with a package or the MSI itself - it could mean a pending reboot is necessary prior to install or something else (like the same version is already installed). Please see MSI log if available. If not, try again adding '--install-arguments="'/l*v
+            end
+          end
+        end
+        $stderr.puts# create the maven repo mockup
+        # populate the maven repo mockup with real file to exercise the load
+        # the workspace directory has a small repository to seed the VM
+        appdata = 'APPDATA'
+        allusersprofile = 'ALLUSERSPROFILE'
+        config.vm.provision :shell, inline: <<-EOF
+
+          $Repository = "${env:#{allusersprofile}}/Jenkins/.m2/repository"
+	  # NOTE: double quotes required to prevent error (mkdir: Cannot find drive. A drive with the name '${env' does not exist).
+	  if (-not (test-path -path $Repository)) {
+            mkdir $Repository
+            write-host ('Creating {0}' -f $Repository)
+          }
+
+          copy-item -recurse -force /vagrant/repository $Repository/..
+          write-host ('Populating {0}' -f $Repository)
+          # https://stackoverflow.com/questions/868264/du-in-powershell
+          # NOTE: verbose
+          function get-diskusage {
+            param(
+              [String]$pathi = "${Repository}"
+            )
+            $groupedList = Get-ChildItem -Recurse -File $path | Group-Object directoryName | select name,@{name='length'; expression={($_.group | Measure-Object -sum length).sum } }
+            foreach ($dn in $groupedList) {
+                New-Object psobject -Property @{ directoryName=$dn.name; length=($groupedList | where { $_.name -like "$($dn.name)*" } | Measure-Object -Sum length).sum }
+            }
+          }
+
+          get-diskusage -path $Repository
+        EOF
+        # Use chef provisioner
+        config.vm.provision :chef_solo do |chef|
+          # chef.version = '14.10.9'
+          # NOTE: can not use Chef 14.x on Windows 7
+          # FATAL: LoadError: Could not open library 'Chef.PowerShell.Wrapper.dll':
+          # https://github.com/chef/chef/issues/8057 suggestion does not help
+          chef.version = '13.10.4'
+          # chef.data_bags_path = 'data_bags'
+          # will require downloading locally -
+          # all chef market cookbook dependencies need to be kept in the '.gitignore'
+          # NOTE: example is now unified.
+          # one still have to comment
+          # 'windows' and 'powershell' dependency cookbook to provision
+          # Linux guest instance node on the Windows host
+          # due to compilation errors it raises
+          chef.add_recipe 'example'
+          chef.log_level = 'info'
+        end
+      end
+    end
+  end
