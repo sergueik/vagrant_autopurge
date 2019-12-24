@@ -1,0 +1,9 @@
+.settings/
+.vagrant/
+*~
+.*.sw?
+cookbooks/windows/***
+cookbooks/powershell/***
+modules/
+environments/*/modules/
+***/cache/***
